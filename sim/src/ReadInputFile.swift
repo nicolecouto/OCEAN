@@ -1,9 +1,35 @@
 import Foundation
 
+extension String {
+
+    var length: Int {
+        return count
+    }
+
+    subscript (i: Int) -> String {
+        return self[i ..< i + 1]
+    }
+
+    func substring(fromIndex: Int) -> String {
+        return self[min(fromIndex, length) ..< length]
+    }
+
+    func substring(toIndex: Int) -> String {
+        return self[0 ..< max(0, toIndex)]
+    }
+
+    subscript (r: Range<Int>) -> String {
+        let range = Range(uncheckedBounds: (lower: max(0, min(length, r.lowerBound)),
+                                            upper: min(length, max(0, r.upperBound))))
+        let start = index(startIndex, offsetBy: range.lowerBound)
+        let end = index(start, offsetBy: range.upperBound - range.lowerBound)
+        return String(self[start ..< end])
+    }
+}
+
 struct Packet {
     public var data : Data
-    public var timeOffsetMs : Int?
-    public var date : NSDate?
+    public var timestamp : Int?
     public var signature = ""
 }
 
@@ -11,7 +37,6 @@ struct Parser {
     private var data : [UInt8]
     private var cursor = 0
     private var firstTimestamp : Int?
-    private var currentYearOffset = 0
     init(data: Data) {
         self.data = [UInt8](repeating: 0, count: data.count)
         data.copyBytes(to: &self.data, count: data.count)
@@ -44,17 +69,6 @@ struct Parser {
         guard line.count > 0 else { return nil }
         return line
     }
-    mutating func foundMarker(_ marker: String) -> Bool {
-        let oldCursor = cursor
-        defer { cursor = oldCursor }
-        for mc in marker {
-            var c = parseChar()
-            if c == nil || c! != mc {
-                return false
-            }
-        }
-        return true
-    }
     mutating func parseHeader() -> String? {
         var header = ""
         var line = parseLine()
@@ -75,51 +89,11 @@ struct Parser {
         repeat {
             line = parseLine()
             guard line != nil else { return nil }
-            if line!.starts(with: "OFFSET_TIME =") {
-                currentYearOffset = Int(line!.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()) ?? 0
-            }
             header = header + line!
         } while !line!.starts(with: "%*****END_FCTD_HEADER_START_RUN*****")
 
         return header
     }
-
-    mutating func extractPartialEndPacket() -> Data? {
-        let oldCursor = cursor
-        defer { cursor = oldCursor }
-        let marker = "%*****START_FCTD_TAILER_END_RUN*****"
-        cursor = data.count - marker.count
-        var partialPacket : Data? = nil
-        while cursor > 2 {
-            if foundMarker(marker) {
-                if !(data[cursor - 1] == Parser.ASCII_LF &&
-                    data[cursor - 2] == Parser.ASCII_CR) &&
-                    // Sometimes there's an extra <LF>
-                    !(data[cursor - 1] == Parser.ASCII_LF &&
-                    data[cursor - 2] == Parser.ASCII_LF &&
-                    data[cursor - 3] == Parser.ASCII_CR) {
-                    var partialPacketStart = cursor
-                    while partialPacketStart > 2 {
-                        if (data[partialPacketStart] == Parser.ASCII_T &&
-                            data[partialPacketStart - 1] == Parser.ASCII_LF &&
-                            data[partialPacketStart - 2] == Parser.ASCII_CR) {
-                            partialPacket = Data(data[partialPacketStart..<cursor])
-                            data.removeSubrange(partialPacketStart..<cursor)
-                            break
-                        }
-                        partialPacketStart -= 1
-                    }
-                }
-                break
-            }
-            cursor -= 1
-        }
-        return partialPacket
-    }
-    mutating func insertPartialEndPacket(_ packet: Data) {
-        data.insert(contentsOf: packet, at: cursor)
-    }
-
     private static let ASCII_LF     = UInt8(0x0A) // '\n'
     private static let ASCII_CR     = UInt8(0x0D) // '\r'
     private static let ASCII_a      = UInt8(0x61) // 'a'
@@ -127,11 +101,6 @@ struct Parser {
     private static let ASCII_z      = UInt8(0x7A) // 'z'
     private static let ASCII_A      = UInt8(0x41) // 'A'
     private static let ASCII_F      = UInt8(0x46) // 'F'
-    private static let ASCII_S      = UInt8(0x53) // 'S'
-    private static let ASCII_O      = UInt8(0x4F) // 'O'
-    private static let ASCII_M      = UInt8(0x4D) // 'M'
-    private static let ASCII_c      = UInt8(0x63) // 'c'
-    private static let ASCII_b      = UInt8(0x62) // 'b'
     private static let ASCII_T      = UInt8(0x54) // 'T'
     private static let ASCII_Z      = UInt8(0x5A) // 'Z'
     private static let ASCII_STAR   = UInt8(0x2A) // '*'
@@ -160,23 +129,8 @@ struct Parser {
                     Parser.isHexDigit(packet[packet.count - 3]) &&
                     Parser.isHexDigit(packet[packet.count - 4]) &&
                     packet[packet.count - 5] == Parser.ASCII_STAR) {
-                    // Sometimes there's an extra <LF>
-                    var nextChar = peekByte()
-                    if (nextChar != nil && nextChar! == Parser.ASCII_LF) {
-                        nextChar = parseByte()
-                        packet.append(nextChar!)
-                        nextChar = peekByte()
-                    }
-                    // First $SOM packet ends abruptly with *cb<CR><LF>
-                    if (packet[0] == Parser.ASCII_DOLLAR &&
-                        packet[1] == Parser.ASCII_S &&
-                        packet[2] == Parser.ASCII_O &&
-                        packet[3] == Parser.ASCII_M &&
-                        packet[packet.count - 3] == Parser.ASCII_b &&
-                        packet[packet.count - 4] == Parser.ASCII_c) {
-                        break
-                    }
-                    // All others are followed by another packet starting with <T>
+                    // Followed by another packet starting with <T>
+                    let nextChar = peekByte()
                     if (nextChar == nil || nextChar! == Parser.ASCII_T) {
                         break
                     }
@@ -189,22 +143,22 @@ struct Parser {
         var i = 0
         // Parse the timestamp immediately following the <T>
         if packet.count > 2 && packet[i] == Parser.ASCII_T {
-            var timestamp = 0
+            p.timestamp = 0
             i = i + 1
             var c = packet[i]
             while i < packet.count && Parser.isDigit(c) {
-                timestamp = timestamp * 10 + Int(c - Parser.ASCII_0)
+                p.timestamp = p.timestamp! * 10 + Int(c - Parser.ASCII_0)
                 i = i + 1
                 c = packet[i]
             }
-            if c == Parser.ASCII_DOLLAR {
+            if c != Parser.ASCII_DOLLAR {
+                p.timestamp = nil
+            } else {
                 if firstTimestamp == nil {
-                    firstTimestamp = timestamp
+                    firstTimestamp = p.timestamp
                 }
-                let timestampSeconds = Double(timestamp) / 100.0
-                p.date = NSDate(timeIntervalSince1970: TimeInterval(Double(currentYearOffset) + timestampSeconds))
                 // Convert from hundreths of seconds to milliseconds
-                p.timeOffsetMs = 10 * (timestamp - firstTimestamp!)
+                p.timestamp = 10 * (p.timestamp! - firstTimestamp!)
             }
         }
         // Parse the signature following the <DOLLAR>
