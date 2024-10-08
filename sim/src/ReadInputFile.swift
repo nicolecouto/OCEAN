@@ -78,7 +78,7 @@ struct Parser {
 
         line = parseLine()
         guard line != nil else { return nil }
-        guard line!.starts(with: "TOTAL_HEADER_LINES = 71") else { return nil }
+        guard line!.starts(with: "TOTAL_HEADER_LINES") else { return nil }
         header = header + line!
 
         line = parseLine()
